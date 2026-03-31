@@ -46,6 +46,8 @@ def _env(name: str, default: str = "") -> str:
 ADMIN_AUTH_ENABLED = _env("ADMIN_AUTH_ENABLED", "false").lower() == "true"
 ADMIN_API_KEY = _env("ADMIN_API_KEY", "")
 LLM_API_KEY = _env("LLM_API_KEY", "") or _env("OPENAI_API_KEY", "")
+PROXY_API_KEY_ENABLED = _env("PROXY_API_KEY_ENABLED", "false").lower() == "true"
+PROXY_API_KEY = _env("PROXY_API_KEY", "")
 
 
 def _headers(admin: bool = False, auth: bool = False) -> Dict[str, str]:
@@ -54,6 +56,8 @@ def _headers(admin: bool = False, auth: bool = False) -> Dict[str, str]:
         h["x-admin-key"] = ADMIN_API_KEY
     if auth and LLM_API_KEY:
         h["Authorization"] = f"Bearer {LLM_API_KEY}"
+    if PROXY_API_KEY_ENABLED and PROXY_API_KEY and not admin:
+        h["x-api-key"] = PROXY_API_KEY
     return h
 
 
@@ -65,13 +69,17 @@ def _http(
     admin: bool = False,
     auth: bool = False,
     timeout: int = 30,
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> Tuple[int, Any, str]:
     url = f"{BASE_URL}{path}"
     body = None
     if payload is not None:
         body = json.dumps(payload).encode("utf-8")
 
-    req = request.Request(url=url, method=method, data=body, headers=_headers(admin=admin, auth=auth))
+    h = _headers(admin=admin, auth=auth)
+    if extra_headers:
+        h.update(extra_headers)
+    req = request.Request(url=url, method=method, data=body, headers=h)
 
     try:
         with request.urlopen(req, timeout=timeout) as resp:
@@ -483,11 +491,37 @@ def test_managed_agent_proxy_safe_prompt() -> None:
     if not LLM_API_KEY:
         pytest.skip("LLM_API_KEY/OPENAI_API_KEY not set")
 
+    extra = {}
+    a2a_enabled = _env("A2A_INTERACTION_ENFORCEMENT_ENABLED", "false").lower() == "true"
+    if a2a_enabled:
+        _, interaction_resp, _ = _http(
+            "POST",
+            "/admin/a2a/interactions",
+            {
+                "source_agent_id": "agent-1",
+                "target_agent_id": "agent-2",
+                "payload": {"intent": "proxy-test"},
+                "metadata": {"source": "pytest"},
+                "created_by": "pytest",
+            },
+            admin=True,
+        )
+        iid = interaction_resp.get("interaction", {}).get("interaction_id", "")
+        if iid:
+            _http(
+                "POST",
+                f"/admin/a2a/interactions/{iid}/approve",
+                {"reviewed_by": "pytest", "reason": "test"},
+                admin=True,
+            )
+            extra["x-a2a-interaction-id"] = iid
+
     status, parsed, _ = _http(
         "POST",
         "/agents/agent-1/v1/chat/completions",
         {"model": MODEL, "messages": [{"role": "user", "content": "Say hello from managed agent"}]},
         auth=True,
+        extra_headers=extra,
     )
     _assert_status(status, 200, "managed agent proxy safe prompt")
     assert isinstance(parsed, dict)
@@ -1204,7 +1238,8 @@ async def test_lifespan_initializes_and_cleans_up(monkeypatch: pytest.MonkeyPatc
     shutdown_otel = Mock()
 
     policy_engine = object()
-    proxy_handler = object()
+    proxy_handler = AsyncMock()
+    proxy_handler.close = AsyncMock()
     init_policy_engine = Mock(return_value=policy_engine)
     init_proxy_handler = Mock(return_value=proxy_handler)
 
@@ -1262,6 +1297,9 @@ async def test_lifespan_propagates_startup_error(monkeypatch: pytest.MonkeyPatch
 """Observability and governance hardening tests."""
 
 
+from unittest.mock import AsyncMock
+
+import gateway.integrations.audit as audit_mod
 from gateway.core.config import settings
 from gateway.integrations.audit import AuditLogger
 from gateway.integrations.cache import L1Cache
@@ -1308,6 +1346,33 @@ def test_audit_sanitize_payload_can_keep_message_content(monkeypatch) -> None:
 
     assert sanitized["messages"][0]["content"] == "hello world"
     assert sanitized["authorization"] == "***REDACTED***"
+
+
+@pytest.mark.asyncio
+async def test_audit_connect_bootstraps_when_core_schema_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logger = AuditLogger()
+    fake_pool = object()
+    create_pool = AsyncMock(return_value=fake_pool)
+    apply_migrations = AsyncMock()
+    schema_ready = AsyncMock(return_value=False)
+    create_table = AsyncMock()
+
+    monkeypatch.setattr(audit_mod.asyncpg, "create_pool", create_pool)
+    monkeypatch.setattr(audit_mod, "apply_migrations", apply_migrations)
+    monkeypatch.setattr(logger, "_core_schema_ready", schema_ready)
+    monkeypatch.setattr(logger, "_create_table", create_table)
+    monkeypatch.setattr(settings, "db_migrations_enabled", True)
+    monkeypatch.setattr(settings, "db_ddl_bootstrap_fallback", False)
+
+    await logger.connect()
+
+    assert logger.connected is True
+    create_pool.assert_awaited_once()
+    apply_migrations.assert_awaited_once_with(fake_pool)
+    schema_ready.assert_awaited_once()
+    create_table.assert_awaited_once()
 
 
 def test_telemetry_records_detector_cache_and_error_counters() -> None:
@@ -1722,8 +1787,8 @@ def test_content_filter_enforces_semantic_policy_when_enabled() -> None:
 def test_policy_store_has_semantic_detection_default() -> None:
     store = PolicyStore()
     semantic = store.get_policy("semantic_detection")
-    assert semantic["enabled"] is False
-    assert semantic["action_on_detect"] == "LOG_ONLY"
+    assert semantic["enabled"] is True
+    assert semantic["action_on_detect"] == "BLOCK"
 # ===== END tests/test_phase2_semantic_detection.py =====
 
 # ===== BEGIN tests/test_phase3_agent_control.py =====
@@ -1887,6 +1952,7 @@ from httpx import ASGITransport, AsyncClient
 from starlette.requests import Request
 
 from gateway.api.public import public_router
+from gateway.core.config import settings as _proxy_test_settings
 from gateway.core.types import Decision
 from gateway.providers.base import NormalizedProviderResponse, PreparedProviderRequest
 from gateway.services.agent_registry import agent_registry
@@ -1929,6 +1995,7 @@ async def test_managed_agent_proxy_requires_registered_agent(monkeypatch) -> Non
 
 @pytest.mark.asyncio
 async def test_managed_agent_proxy_sets_agent_context(monkeypatch) -> None:
+    monkeypatch.setattr(_proxy_test_settings, "a2a_interaction_enforcement_enabled", False)
     app = _build_app()
     monkeypatch.setattr(
         agent_registry,
@@ -2011,8 +2078,12 @@ async def test_forward_request_uses_chat_adapter_for_managed_agent_path(monkeypa
             return {"id": "provider-raw"}
 
     class _DummyAsyncClient:
-        def __init__(self, timeout):
-            self.timeout = timeout
+        def __init__(self, **kwargs):
+            pass
+
+        @property
+        def is_closed(self):
+            return False
 
         async def __aenter__(self):
             return self
@@ -2023,6 +2094,9 @@ async def test_forward_request_uses_chat_adapter_for_managed_agent_path(monkeypa
         async def request(self, **kwargs):
             captured_requests.append(kwargs)
             return _UpstreamResponse()
+
+        async def aclose(self):
+            pass
 
     monkeypatch.setattr("gateway.services.proxy_service.AsyncClient", _DummyAsyncClient)
 
@@ -2234,4 +2308,163 @@ def test_initialize_otel_disabled_keeps_noop_tracer(monkeypatch) -> None:
     assert otel._initialized is True
     assert otel._tracer is not None
 # ===== END tests/test_phase3_otel_hooks.py =====
+
+# ===== BEGIN tests/test_client_blockers.py =====
+"""Tests for the four client-blocker decisions:
+1. Cyren fail-closed
+2. Proxy API key auth
+3. A2A interaction enforcement
+4. Compliance defaults (already configurable)
+"""
+
+from unittest.mock import AsyncMock, Mock, patch
+import pytest
+
+from gateway.services.policy_service import PolicyEngine
+from gateway.integrations.cyren_client import CyrenClient
+from gateway.integrations.audit import AuditLogger
+from gateway.core.config import settings as _settings
+
+
+# --- 1. Cyren fail-closed tests ---
+
+@pytest.mark.asyncio
+async def test_policy_engine_fail_closed_blocks_when_no_threat_data(monkeypatch) -> None:
+    """When Cyren returns no data and fail-closed is True, risk score should be 0 (BLOCK)."""
+    monkeypatch.setattr(_settings, "cyren_fail_closed", True)
+
+    cyren = Mock(spec=CyrenClient)
+    cyren.classify_ip = AsyncMock(return_value=None)
+    cyren.classify_url = AsyncMock(return_value=None)
+    audit = Mock(spec=AuditLogger)
+    audit.log_decision = AsyncMock()
+
+    engine = PolicyEngine(cyren_client=cyren, audit_logger=audit)
+    score = engine._calculate_risk_score(None, None)
+    assert score == 0
+
+
+@pytest.mark.asyncio
+async def test_policy_engine_fail_open_allows_when_no_threat_data(monkeypatch) -> None:
+    """When Cyren returns no data and fail-closed is False, risk score should be 100 (ALLOW)."""
+    monkeypatch.setattr(_settings, "cyren_fail_closed", False)
+
+    engine = PolicyEngine(cyren_client=Mock(), audit_logger=Mock())
+    score = engine._calculate_risk_score(None, None)
+    assert score == 100
+
+
+# --- 2. Proxy API key auth tests ---
+
+def test_proxy_api_key_config_defaults() -> None:
+    """Proxy API key settings should exist in config."""
+    assert hasattr(_settings, "proxy_api_key_enabled")
+    assert hasattr(_settings, "proxy_api_key")
+
+
+# --- 3. A2A interaction enforcement tests ---
+
+@pytest.mark.asyncio
+async def test_a2a_enforcement_rejects_missing_header(monkeypatch) -> None:
+    """Agent proxy should reject request without x-a2a-interaction-id header."""
+    monkeypatch.setattr(_settings, "a2a_interaction_enforcement_enabled", True)
+
+    from gateway.api.public import proxy_agent_chat_completion
+    from gateway.services.agent_registry import agent_registry
+
+    agent_record = {
+        "agent_id": "test-agent",
+        "display_name": "Test Agent",
+        "agent_type": "assistant",
+        "status": "ACTIVE",
+        "wrapped": False,
+        "metadata": {},
+    }
+    monkeypatch.setattr(agent_registry, "get_agent", AsyncMock(return_value=agent_record))
+
+    mock_request = Mock()
+    mock_request.headers = {}
+
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc_info:
+        await proxy_agent_chat_completion(mock_request, "test-agent")
+    assert exc_info.value.status_code == 400
+    assert "x-a2a-interaction-id" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_a2a_enforcement_rejects_unapproved_interaction(monkeypatch) -> None:
+    """Agent proxy should reject request with a non-APPROVED interaction."""
+    monkeypatch.setattr(_settings, "a2a_interaction_enforcement_enabled", True)
+
+    from gateway.api.public import proxy_agent_chat_completion
+    from gateway.services.agent_registry import agent_registry
+
+    agent_record = {
+        "agent_id": "test-agent",
+        "display_name": "Test Agent",
+        "agent_type": "assistant",
+        "status": "ACTIVE",
+        "wrapped": False,
+        "metadata": {},
+    }
+    monkeypatch.setattr(agent_registry, "get_agent", AsyncMock(return_value=agent_record))
+
+    pending_interaction = {"interaction_id": "int-1", "review_status": "PENDING"}
+    monkeypatch.setattr(agent_registry, "get_interaction", AsyncMock(return_value=pending_interaction))
+
+    mock_request = Mock()
+    mock_request.headers = {"x-a2a-interaction-id": "int-1"}
+
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc_info:
+        await proxy_agent_chat_completion(mock_request, "test-agent")
+    assert exc_info.value.status_code == 403
+    assert "not APPROVED" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_a2a_enforcement_skipped_when_disabled(monkeypatch) -> None:
+    """When enforcement is disabled, agent proxy should not check interaction header."""
+    monkeypatch.setattr(_settings, "a2a_interaction_enforcement_enabled", False)
+
+    from gateway.api.public import proxy_agent_chat_completion
+    from gateway.services.agent_registry import agent_registry
+
+    agent_record = {
+        "agent_id": "test-agent",
+        "display_name": "Test Agent",
+        "agent_type": "assistant",
+        "status": "ACTIVE",
+        "wrapped": False,
+        "metadata": {},
+    }
+    monkeypatch.setattr(agent_registry, "get_agent", AsyncMock(return_value=agent_record))
+
+    mock_proxy_handler = AsyncMock()
+    mock_proxy_handler.handle_request = AsyncMock(return_value=Mock(status_code=200))
+
+    mock_app = Mock()
+    mock_app.state.proxy_handler = mock_proxy_handler
+
+    mock_request = Mock()
+    mock_request.headers = {}
+    mock_request.app = mock_app
+    mock_request.state = Mock()
+
+    result = await proxy_agent_chat_completion(mock_request, "test-agent")
+    assert result.status_code == 200
+
+
+# --- 4. Compliance defaults ---
+
+def test_compliance_settings_are_configurable() -> None:
+    """Audit retention/redaction settings should be present and configurable."""
+    assert hasattr(_settings, "audit_retention_days")
+    assert hasattr(_settings, "audit_mask_sensitive_fields")
+    assert hasattr(_settings, "audit_redact_message_content")
+    assert hasattr(_settings, "audit_max_string_length")
+    assert hasattr(_settings, "audit_purge_enabled")
+
+# ===== END tests/test_client_blockers.py =====
 

@@ -17,9 +17,17 @@ class Settings(BaseSettings):
     port: int = Field(default=8000, description="Gateway port")
     workers: int = Field(default=1, description="Number of worker processes")
     log_level: str = Field(default="INFO", description="Logging level")
+    log_format: str = Field(
+        default="text",
+        description="Logging format: 'text' for human-readable, 'json' for structured JSON",
+    )
     upstream_timeout_seconds: float = Field(
         default=60.0,
         description="Timeout in seconds for upstream LLM provider calls",
+    )
+    max_request_body_bytes: int = Field(
+        default=10_485_760,
+        description="Maximum request body size in bytes (default 10 MB); 0 disables",
     )
 
     rate_limit_enabled: bool = Field(
@@ -93,6 +101,10 @@ class Settings(BaseSettings):
     cyren_retry_attempts: int = Field(
         default=2,
         description="Number of retry attempts for Cyren API"
+    )
+    cyren_fail_closed: bool = Field(
+        default=True,
+        description="Block traffic when Cyren is unavailable (fail-closed); false = fail-open",
     )
     ctas_url: str = Field(
         default="https://try-now-antispam.data443.io/ctasd/ClassifyMessage_Inline",
@@ -261,10 +273,24 @@ class Settings(BaseSettings):
         description="Run legacy CREATE TABLE bootstrap SQL after migrations",
     )
 
+    # Proxy API key authentication
+    proxy_api_key_enabled: bool = Field(
+        default=False,
+        description="Require API key (x-api-key header) for proxy endpoints",
+    )
+    proxy_api_key: str = Field(
+        default="",
+        description="Static API key that proxy callers must provide in x-api-key header",
+    )
+
     # Agent governance hardening
     agent_link_enforcement_enabled: bool = Field(
         default=True,
         description="Require an active A2A link before creating agent interactions",
+    )
+    a2a_interaction_enforcement_enabled: bool = Field(
+        default=True,
+        description="Require an APPROVED a2a_interaction_id header on agent proxy calls",
     )
     agent_interaction_retention_days: int = Field(
         default=30,

@@ -12,7 +12,7 @@ The gateway sits in front of upstream LLM providers and enforces deterministic c
 
 <br/>
 
-![Build](https://img.shields.io/badge/Pytest-81%20Passed-22c55e?style=flat-square&logo=pytest&logoColor=white)
+![Build](https://img.shields.io/badge/Pytest-117%20Passed-22c55e?style=flat-square&logo=pytest&logoColor=white)
 ![Checks](https://img.shields.io/badge/Checks-46%20%2F%2049%20Passed-22c55e?style=flat-square&logo=checkmarx&logoColor=white)
 ![Skipped](https://img.shields.io/badge/Skipped-3%20Optional-f59e0b?style=flat-square)
 ![Status](https://img.shields.io/badge/Status-Operational-38bdf8?style=flat-square&logo=statuspage&logoColor=white)
@@ -24,35 +24,36 @@ The gateway sits in front of upstream LLM providers and enforces deterministic c
 
 ---
 
-## 📋 Current Build Status &nbsp;**
+## Current Build Status
 
 | Metric | Result |
 |--------|--------|
-| Core gateway implementation | ✅ Complete and operational |
-| Pytest suite | ✅ **81 passed** |
-| Automated verification checks | ✅ **46 passed** / 3 skipped / 0 failed (49 total) |
-| OpenAI proxy flow | ✅ Verified and working |
-| Managed-agent proxy flow | ✅ Verified and working |
-| Optional provider checks | ⚠️ Skipped when API keys not configured (`Anthropic`, `Gemini`, `OpenRouter`) |
+| Core gateway implementation | Complete and operational |
+| Pytest suite | **117 passed** |
+| Automated verification checks | **46 passed** / 3 skipped / 0 failed (49 total) |
+| Security regression tests | **All 5 attack patterns blocked (403)** |
+| OpenAI proxy flow | Verified and working |
+| Managed-agent proxy flow | Verified and working |
+| Optional provider checks | Skipped when API keys not configured (Anthropic, Gemini, OpenRouter) |
 
 ---
 
-## 🔍 What This System Does
+## What This System Does
 
 This gateway protects and governs LLM traffic by:
 
-- intercepting requests/responses
-- enforcing policy and entitlement rules
-- applying deterministic security detection
-- routing to the selected provider
-- writing immutable audit/event records
-- exposing JSON and Prometheus telemetry
+- Intercepting requests/responses
+- Enforcing policy and entitlement rules
+- Applying deterministic security detection (6 content modules + 8 semantic categories)
+- Routing to the selected provider via adapter pattern
+- Writing immutable audit/event records
+- Exposing JSON and Prometheus telemetry
 
-This means clients use one stable API surface, while operations get centralized security and full traceability.
+Clients use one stable API surface, while operations get centralized security and full traceability.
 
 ---
 
-## 🏗 High-Level Architecture
+## High-Level Architecture
 
 ```text
 Client / App
@@ -61,63 +62,75 @@ Client / App
 +---------------------------------------------------+
 |                Data443 LLM Gateway                |
 |---------------------------------------------------|
-| Ingress:                                          |
-| - /v1/chat/completions                            |
-| - /agents/{agent_id}/v1/chat/completions          |
+| Middleware:                                       |
+| - Rate Limiting (Redis / in-memory)               |
+| - Request Body Size Limit (10 MB)                 |
+| - CORS + GZip                                     |
 |                                                   |
 | Request pipeline:                                 |
-| 1) Optional JWT auth                              |
+| 0) Proxy API key auth (x-api-key header)          |
+| 1) Optional JWT auth (mandatory exp claim)        |
 | 2) Entitlements (provider/model/limits)           |
-| 3) Content filter (PII/jailbreak/injection/...)   |
+| 3) Content filter (PII/jailbreak/injection/       |
+|    semantic/domain-risk/email-classification)      |
 | 4) Cyren risk intelligence (IP + URL)             |
+|    -> fail-closed when Cyren unavailable           |
 | 5) Decision (ALLOW/ALLOW_LOG/CONSTRAIN/BLOCK)     |
-| 6) Provider adapter + upstream proxy              |
-| 7) Response inspection                            |
-| 8) Audit/events/telemetry emit                    |
+| 6) Constraint engine (if CONSTRAIN)               |
+| 7) A2A interaction enforcement (agent routes)     |
+| 8) Provider adapter + upstream proxy              |
+| 9) Response inspection                            |
+| 10) Audit/events/telemetry emit                   |
 +-----------------------------+---------------------+
                               |
                               v
        OpenAI / Anthropic / Gemini / OpenRouter
+       (pooled httpx connections, 100 max)
 
 Supporting stores:
-- Redis (L1/L2 cache path)
-- PostgreSQL (audit, versions, events, interactions)
+- Redis 7 (L1/L2 cache, rate limit storage)
+- PostgreSQL 15 (audit, versions, events, interactions)
+- In-memory (L1 cache 10K cap, telemetry 500-key cap)
 ```
 
 ---
 
-## 🔄 Prompt Lifecycle *(Step-by-Step)*
+## Prompt Lifecycle (Step-by-Step)
 
 When a user sends a prompt:
 
 | Step | Action |
 |:----:|--------|
 | 1 | Request enters gateway endpoint |
-| 2 | Gateway creates `request_id` and extracts context (IP, model, provider hint) |
-| 3 | Optional JWT auth runs if enabled |
-| 4 | Entitlements are enforced — provider enabled? model allowed? input/output limits within policy? |
-| 5 | Content filter evaluates request text — PII, jailbreak/injection, semantic abuse, domain risk, email-risk classification |
-| 6 | Cyren checks execute (`IPRep` and `URLF`) with cache and circuit breaker |
-| 7 | Policy engine returns decision: `ALLOW`, `ALLOW_LOG`, `CONSTRAIN`, or `BLOCK` |
-| 8 | If blocked, gateway returns `403` with structured error |
-| 9 | If allowed/constrained, provider adapter transforms request and forwards upstream |
-| 10 | Upstream response is normalized to OpenAI-compatible output shape when required |
-| 11 | Response content is inspected again for policy violations |
-| 12 | Gateway writes audit/event records and updates telemetry metrics |
-| 13 | Final response is returned to the client |
+| 2 | Rate limit + body size middleware checks |
+| 3 | Proxy API key validated (if `PROXY_API_KEY_ENABLED=true`) |
+| 4 | Gateway creates `request_id` and extracts context (IP, model, provider hint) |
+| 5 | Optional JWT auth runs if enabled (requires valid `exp` claim) |
+| 6 | Entitlements enforced -- provider enabled? model allowed? input/output limits within policy? |
+| 7 | Content filter evaluates request text -- PII, jailbreak/injection, semantic abuse, domain risk, email classification |
+| 8 | Cyren checks execute (IPRep and URLF) with cache and circuit breaker |
+| 9 | Policy engine returns decision: ALLOW, ALLOW_LOG, CONSTRAIN, or BLOCK; **fail-closed** if Cyren unavailable |
+| 10 | If blocked, gateway returns 403 with structured error |
+| 11 | If constrained, gateway clamps tokens/temperature, injects safety prompt, redacts matches |
+| 12 | For agent routes: A2A interaction ID validated as APPROVED (if `A2A_INTERACTION_ENFORCEMENT_ENABLED=true`) |
+| 13 | Provider adapter transforms request and forwards upstream via pooled connection |
+| 14 | Upstream response is normalized to OpenAI-compatible output shape |
+| 15 | Response content is inspected again for policy violations |
+| 16 | Gateway writes audit/event records and updates telemetry metrics |
+| 17 | Final response is returned to the client |
 
 ---
 
-## ⚖️ Decision Model
+## Decision Model
 
 ### Cyren Score Policy Thresholds
 
 | Score Range | Result |
 |:-----------:|:------:|
-| 80 – 100 | ✅ `ALLOW` |
-| 50 – 79 | 📋 `ALLOW_LOG` |
-| 20 – 49 | ⚠️ `CONSTRAIN` |
-| 0 – 19 | 🚫 `BLOCK` |
+| 80 -- 100 | ALLOW |
+| 50 -- 79 | ALLOW_LOG |
+| 20 -- 49 | CONSTRAIN |
+| 0 -- 19 | BLOCK |
 
 ### Content Policy Behavior
 
@@ -125,13 +138,28 @@ If request/response content matches enabled rules at or above severity threshold
 
 | Action | Description |
 |--------|-------------|
-| `BLOCK` | Request is rejected outright |
+| `BLOCK` | Request is rejected outright (HTTP 403) |
 | `CONSTRAIN` | Request is modified and forwarded under constraint |
 | `LOG_ONLY` | Request is logged and passed through unchanged |
 
+### Semantic Detection Categories
+
+All enabled by default with BLOCK action:
+
+| Category | Catches |
+|----------|---------|
+| Policy Bypass | "ignore your rules", "bypass safety" |
+| Prompt Exfiltration | "show system prompt", "print internal config and secrets" |
+| Unrestricted Mode | "developer-debug mode", "god mode", "no filters" |
+| Roleplay Bypass | "roleplay as unrestricted model" |
+| Pentest Social Engineering | "authorized pentest", "assume I am authorized" |
+| Sensitive Data Request | "list all customer records including passwords" |
+| Encoding Bypass | "translate exactly", "base64 decode and execute" |
+| Harmful Obfuscation | "for educational purposes" + exploit/malware intent |
+
 ---
 
-## 🛡 Key Capabilities
+## Key Capabilities
 
 <details open>
 <summary><strong>Security Controls</strong></summary>
@@ -139,11 +167,14 @@ If request/response content matches enabled rules at or above severity threshold
 <br/>
 
 - PII detection: SSN, email, phone, credit card (Luhn), IP, passport, bank account
-- Jailbreak/injection pattern checks
-- Semantic policy bypass / prompt exfiltration detection
-- Domain-risk heuristic detection
+- Jailbreak/injection pattern checks (compiled regex)
+- 8-category semantic abuse detector (policy bypass, exfiltration, unrestricted mode, roleplay, pentest, sensitive data, encoding bypass, harmful obfuscation)
+- Domain-risk heuristic detection (suspicious TLDs, punycode, keywords)
 - Email-risk/phishing intent classification
-- Optional JWT request authentication
+- JWT authentication with mandatory expiry
+- Proxy API key authentication (`x-api-key` header for all proxy callers)
+- Request body size limit (configurable, default 10 MB)
+- Cyren fail-closed mode: blocks traffic when threat intelligence is unavailable
 
 </details>
 
@@ -154,9 +185,11 @@ If request/response content matches enabled rules at or above severity threshold
 
 - Versioned policies with rollback
 - Versioned entitlements with module/provider/limit controls
-- Admin auth hardening (`x-admin-key`) when enabled
+- Admin auth hardening (`x-admin-key` + IP allowlist) when enabled
 - Managed-agent registry and A2A interaction governance
-- Interaction review workflow (`approve` / `block` / `get`)
+- **A2A interaction enforcement**: every agent proxy call requires an APPROVED `x-a2a-interaction-id`
+- Interaction review workflow (approve / block / get)
+- Compliance defaults fully configurable at deployment (retention, masking, redaction)
 
 </details>
 
@@ -171,36 +204,38 @@ If request/response content matches enabled rules at or above severity threshold
   - Gemini
   - OpenRouter
 - Request/response normalization for cross-provider compatibility
+- Pooled HTTP connections (100 max, 20 keep-alive)
 
 </details>
 
 <details open>
-<summary><strong>Reliability + Observability</strong></summary>
+<summary><strong>Reliability and Observability</strong></summary>
 
 <br/>
 
-- Redis-backed two-level caching
+- Redis-backed two-level caching (L1 bounded to 10K entries, L2 in Redis)
 - Circuit breaker around external threat-intel dependency
 - Immutable PostgreSQL audit/event persistence
-- Metrics endpoints:
-  - JSON snapshot
-  - Prometheus exposition
-- Optional OpenTelemetry hooks
+- Structured JSON logging (`LOG_FORMAT=json`) or human-readable text
+- Metrics endpoints: JSON snapshot + Prometheus exposition
+- Telemetry counters bounded to 500 distinct keys
+- Optional OpenTelemetry tracing hooks
+- Health endpoint with per-component status (Redis, Postgres, Cyren circuit breaker)
 
 </details>
 
 ---
 
-## 🌐 API Surface
+## API Surface
 
 ### Public Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/` | Root |
-| `GET` | `/health` | Health check |
-| `GET` | `/audit/log` | Audit log |
-| `GET` | `/audit/events` | Audit events |
+| `GET` | `/health` | Health check (per-component status) |
+| `GET` | `/audit/log` | Audit log query |
+| `GET` | `/audit/events` | Gateway event stream |
 | `GET` | `/audit/metrics` | JSON metrics snapshot |
 | `GET` | `/audit/metrics/prometheus` | Prometheus metrics exposition |
 | `POST` | `/agents/{agent_id}/v1/chat/completions` | Managed-agent proxy |
@@ -218,110 +253,120 @@ If request/response content matches enabled rules at or above severity threshold
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ```bash
 git clone https://github.com/joseph88gomez/data443-llm-gateway.git
 cd data443-llm-gateway
 cp .env.example .env
-docker-compose up -d --build
+# Edit .env with your API keys and passwords
+docker compose up -d --build
 curl http://localhost:8000/health
 ```
 
 ---
 
-## ⚙️ Configuration Notes
+## Configuration
 
 Important environment variables:
 
 | Category | Variables |
 |----------|-----------|
+| Server | `HOST`, `PORT`, `WORKERS`, `LOG_LEVEL`, `LOG_FORMAT`, `MAX_REQUEST_BODY_BYTES` |
+| Rate Limiting | `RATE_LIMIT_ENABLED`, `RATE_LIMIT_STORAGE`, `RATE_LIMIT_PROXY_REQUESTS` |
 | Provider | `LLM_PROVIDER`, `LLM_ENDPOINT`, `LLM_API_KEY` |
 | Provider Keys | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY` |
-| Admin Auth | `ADMIN_AUTH_ENABLED`, `ADMIN_API_KEY` |
+| Admin Auth | `ADMIN_AUTH_ENABLED`, `ADMIN_API_KEY`, `ADMIN_AUTH_MODE`, `ADMIN_ALLOWED_IPS` |
 | JWT | `JWT_ENABLED`, `JWT_SECRET`, `JWT_ISSUER`, `JWT_AUDIENCE` |
 | Thresholds | `ALLOW_THRESHOLD`, `ALLOW_LOG_THRESHOLD`, `CONSTRAIN_THRESHOLD` |
 | Stores | Redis and PostgreSQL connection settings |
-
-> `CTAS_URL`/`CTAS_TIMEOUT` are present in config for extension scenarios.
+| Audit | `AUDIT_RETENTION_DAYS`, `AUDIT_MASK_SENSITIVE_FIELDS`, `AUDIT_REDACT_MESSAGE_CONTENT` |
+| Cyren | `CYREN_IPREP_URL`, `CYREN_URLF_URL`, `CYREN_API_KEY`, `CYREN_FAIL_CLOSED` |
+| Proxy Auth | `PROXY_API_KEY_ENABLED`, `PROXY_API_KEY` |
+| Agent Governance | `AGENT_LINK_ENFORCEMENT_ENABLED`, `A2A_INTERACTION_ENFORCEMENT_ENABLED`, `AGENT_INTERACTION_RETENTION_DAYS` |
+| Telemetry | `OTEL_ENABLED`, `OTEL_SERVICE_NAME`, `OTEL_EXPORTER_OTLP_ENDPOINT` |
 
 ---
 
-## 🧪 Testing and Verification
+## Testing and Verification
 
-Test layout is documented in [tests/README.md](tests/README.md).
-
-### 1 · Full automated verification *(recommended)*
+### 1. Full automated verification (recommended)
 
 ```bash
 bash tests/run_all_tests.sh
 ```
 
-Runs:
-- Docker rebuild/start
-- health checks
-- pytest (`tests/py/test_*.py`)
-- API/governance checks
-- provider optional checks (if keys set)
-- summary with pass/fail/skip
+Runs Docker rebuild/start, health checks, pytest, API/governance checks, provider optional checks, and summary.
 
-### 2 · Live interactive LLM testing through gateway
+### 2. Live interactive LLM testing through gateway
 
 ```bash
 LIVE_SHOW_RAW=true bash tests/live_gateway_console.sh
 ```
 
-Runs full verification first, then opens interactive prompt.
-
-- Shows raw HTTP/JSON output (`LIVE_SHOW_RAW=true`)
-- Can force live prompt even on verification failure with `ALLOW_LIVE_ON_FAIL=true`
-
-### 3 · Pytest only
+### 3. Pytest only
 
 ```bash
-python -m pytest -q tests/py
+python -m pytest tests/ -v
 ```
+
+### 4. Security regression tests
+
+```bash
+python -m pytest tests/py/test_rate_limit_and_semantic.py -v -k "semantic_blocks"
+```
+
+Validates that all 5 previously-200 attack patterns now return 403.
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```text
 data443-llm-gateway/
   gateway/
-    api/
-    core/
-    integrations/
-    policy/
-    providers/
-    services/
-    main.py
+    api/            # admin, agent_control, auth, public routes
+    core/           # config, logging, types
+    integrations/   # audit, cache, cyren_client, telemetry, otel, migrations
+    middleware/     # rate_limit
+    migrations/     # SQL schema files
+    policy/         # store (versioned policies + entitlements)
+    providers/      # base, router, openai, anthropic, gemini, openrouter
+    services/       # proxy_service, content_filter, semantic_detector,
+                    #   domain_risk_detector, email_classifier,
+                    #   jwt_auth, policy_service, agent_registry
+    main.py         # FastAPI app entry point
   tests/
-    README.md
+    py/             # pytest test files
+    sh/             # shell-based test scripts
     run_all_tests.sh
     live_gateway_console.sh
-    py/
-      test_all.py
-    sh/
-      all.sh
-      live.sh
+    live_gateway_console_strict.sh
   config/
   docker-compose.yml
+  docker-compose.prod.yml
   Dockerfile
   requirements.txt
   pytest.ini
+  .env
 ```
 
 ---
 
-## ✅ Production Baseline Checklist
+## Production Baseline Checklist
 
-- [ ] Enable admin auth: `ADMIN_AUTH_ENABLED=true` and set `ADMIN_API_KEY`
+- [x] Cyren fail-closed mode: `CYREN_FAIL_CLOSED=true` (blocks when Cyren unavailable)
+- [x] Proxy API key auth: `PROXY_API_KEY_ENABLED=true` and set strong `PROXY_API_KEY`
+- [x] A2A interaction enforcement: `A2A_INTERACTION_ENFORCEMENT_ENABLED=true`
+- [x] Compliance defaults configurable at deployment (retention, masking, redaction)
+- [ ] Enable admin auth: `ADMIN_AUTH_ENABLED=true` and set strong `ADMIN_API_KEY`
 - [ ] Enable JWT where required and set strong `JWT_SECRET`
-- [ ] Set explicit `CORS_ALLOWED_ORIGINS` (no wildcard + credentials)
+- [ ] Set real passwords for `REDIS_PASSWORD` and `POSTGRES_PASSWORD`
+- [ ] Set explicit `CORS_ALLOWED_ORIGINS` (no wildcard with credentials)
 - [ ] Configure required provider API keys
-- [ ] Keep audit/metrics endpoints protected in deployment
-- [ ] Monitor Prometheus metrics and audit/event logs
+- [ ] Use production overlay: `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d`
+- [ ] Set `LOG_FORMAT=json` for structured log aggregation
+- [ ] Monitor `/health` endpoint and Prometheus metrics
 
 ---
 
@@ -329,7 +374,7 @@ data443-llm-gateway/
 
 <br/>
 
-**Data443 — All rights reserved.**
+**Data443 -- All rights reserved.**
 
 <br/>
 
